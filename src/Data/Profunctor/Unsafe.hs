@@ -256,6 +256,8 @@ instance Contravariant f => Profunctor (Clown f) where
   {-# INLINE rmap #-}
   dimap f _ (Clown fa) = Clown (contramap f fa)
   {-# INLINE dimap #-}
+  (#.) _ = coerce
+  {-# INLINE (#.) #-}
 
 instance Functor f => Profunctor (Joker f) where
   lmap _ (Joker fb) = Joker fb

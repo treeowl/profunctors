@@ -3,6 +3,8 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 #if __GLASGOW_HASKELL__ >= 704 && __GLASGOW_HASKELL__ < 708
 {-# LANGUAGE Trustworthy #-}
@@ -44,6 +46,7 @@ import Data.Bifunctor.Clown (Clown(..))
 import Data.Bifunctor.Product (Product(..))
 import Data.Bifunctor.Tannen (Tannen(..))
 import Data.Functor.Contravariant (Contravariant(..))
+import Data.Functor.Identity (Identity (..))
 import Data.Monoid hiding (Product)
 import Data.Profunctor.Adjunction
 import Data.Profunctor.Monad
@@ -51,6 +54,7 @@ import Data.Profunctor.Types
 import Data.Profunctor.Unsafe
 import Data.Tagged
 import Data.Tuple
+import Data.Coerce
 import Prelude hiding (id,(.))
 
 ------------------------------------------------------------------------------
@@ -93,9 +97,66 @@ class Profunctor p => Strong p where
   second' :: p a b -> p (c, a) (c, b)
   second' = dimap swap swap . first'
 
+  -- | A custom definition of 'lensical' will often be more efficient than
+  -- the default.
+  lensical :: Functor f => (s -> a) -> (s -> b -> t) -> p a (f b) -> p s (f t)
+  lensical getter setter = dimap (setter &&& getter) (uncurry fmap) . second'
+
+  -- | A custom definition of 'prolensical' will sometimes be more efficient
+  -- than the default.
+  prolensical :: (s -> a) -> (s -> b -> t) -> p a b -> p s t
+  prolensical getter setter = dimap (setter &&& getter) (uncurry ($)) . second'
+
 #if __GLASGOW_HASKELL__ >= 708
   {-# MINIMAL first' | second' #-}
 #endif
+
+-- | A suitable definition of 'dimap' for an instance defining 'lensical'
+dimapLensically :: Strong p => (a' -> a) -> (b -> b') -> p a b -> p a' b'
+dimapLensically f g = (runIdentity #.)
+                      . lensical f (const g)
+                      . (Identity #.)
+
+-- | A suitable definition of 'dimap' for an instance defining 'prolensical'
+dimapProlensically :: Strong p => (a' -> a) -> (b -> b') -> p a b -> p a' b'
+dimapProlensically f g = prolensical f (const g)
+
+-- | A suitable definition of 'first'' for an instance defining 'lensical'
+firstLensically :: Strong p => p a b -> p (a, c) (b, c)
+firstLensically = (runIdentity #.)
+                  . lensical fst (\(_, c) b -> (b, c))
+                  . (Identity #.)
+
+-- | A suitable definition of 'first'' for an instance defining 'prolensical'
+firstProlensically :: Strong p => p a b -> p (a, c) (b, c)
+firstProlensically = prolensical fst (\(_, c) b -> (b, c))
+
+-- | A suitable definition of 'second'' for an instance defining 'lensical'
+secondLensically :: Strong p => p a b -> p (c, a) (c, b)
+secondLensically = (runIdentity #.)
+                  . lensical snd (\(c, _) b -> (c, b))
+                  . (Identity #.)
+
+-- | A suitable definition of 'second'' for an instance defining 'prolensical'
+secondProlensically :: Strong p => p a b -> p (c, a) (c, b)
+secondProlensically = prolensical snd (\(c, _) b -> (c, b))
+
+-- | A suitable definition of 'lensical' for an instance defining
+-- 'prolensical'
+lensicalProlensically ::
+     (Strong p, Functor f)
+  => (s -> a) -> (s -> b -> t) -> p a (f b) -> p s (f t)
+lensicalProlensically getter setter = prolensical getter (fmap . setter)
+
+-- | A suitable definition of 'prolensical' for an instance defining
+-- 'lensical'.
+prolensicalLensically :: Strong p =>
+  (s -> a) -> (s -> b -> t) -> p a b -> p s t
+prolensicalLensically getter setter =
+    (runIdentity #.) . lensical getter setter . (Identity #.)
+-- This is efficient given good definitions of 'lensical',
+-- '#.', and '.#'.
+
 
 uncurry' :: Strong p => p a (b -> c) -> p (a, b) c
 uncurry' = rmap (\(f,x) -> f x) . first'
@@ -106,6 +167,8 @@ instance Strong (->) where
   {-# INLINE first' #-}
   second' ab ~(c, a) = (c, ab a)
   {-# INLINE second' #-}
+  lensical getter setter afb s = setter s <$> afb (getter s)
+  {-# INLINE lensical #-}
 
 instance Monad m => Strong (Kleisli m) where
   first' (Kleisli f) = Kleisli $ \ ~(a, c) -> do
@@ -116,12 +179,24 @@ instance Monad m => Strong (Kleisli m) where
      b <- f a
      return (c, b)
   {-# INLINE second' #-}
+  lensical getter setter (Kleisli mafb) =
+    Kleisli $ \s -> liftM (fmap (setter s)) (mafb (getter s))
+  {-# INLINE lensical #-}
+  prolensical getter setter (Kleisli mafb) =
+    Kleisli $ \s -> liftM (setter s) $ mafb (getter s)
+  {-# INLINE prolensical #-}
 
 instance Functor m => Strong (Star m) where
   first' (Star f) = Star $ \ ~(a, c) -> (\b' -> (b', c)) <$> f a
   {-# INLINE first' #-}
   second' (Star f) = Star $ \ ~(c, a) -> (,) c <$> f a
   {-# INLINE second' #-}
+  lensical getter setter (Star f) = Star $ \s ->
+    fmap (fmap (setter s)) $ f (getter s)
+  {-# INLINE lensical #-}
+  prolensical getter setter (Star f) = Star $ \s ->
+    fmap (setter s) $ f (getter s)
+  {-# INLINE prolensical #-}
 
 -- | 'Arrow' is 'Strong' 'Category'
 instance Arrow p => Strong (WrappedArrow p) where
@@ -135,24 +210,43 @@ instance Strong (Forget r) where
   {-# INLINE first' #-}
   second' (Forget k) = Forget (k . snd)
   {-# INLINE second' #-}
+  lensical getter _setter (Forget k) = Forget $ k . getter
+  {-# INLINE lensical #-}
 
 instance Contravariant f => Strong (Clown f) where
   first' (Clown fa) = Clown (contramap fst fa)
   {-# INLINE first' #-}
   second' (Clown fa) = Clown (contramap snd fa)
   {-# INLINE second' #-}
+  lensical getter _setter (Clown fa) = Clown $
+    contramap getter fa
+  prolensical getter _setter (Clown fa) = Clown $
+    contramap getter fa
 
 instance (Strong p, Strong q) => Strong (Product p q) where
   first' (Pair p q) = Pair (first' p) (first' q)
   {-# INLINE first' #-}
   second' (Pair p q) = Pair (second' p) (second' q)
   {-# INLINE second' #-}
+  lensical getter setter (Pair p q) =
+    Pair (lensical getter setter p) (lensical getter setter q)
+  {-# INLINE lensical #-}
+  prolensical getter setter (Pair p q) =
+    Pair (prolensical getter setter p) (prolensical getter setter q)
+  {-# INLINE prolensical #-}
 
 instance (Functor f, Strong p) => Strong (Tannen f p) where
   first' (Tannen fp) = Tannen (fmap first' fp)
   {-# INLINE first' #-}
   second' (Tannen fp) = Tannen (fmap second' fp)
   {-# INLINE second' #-}
+  lensical getter setter (Tannen p) =
+    Tannen $ fmap (lensical getter setter) p
+  {-# INLINE lensical #-}
+  prolensical getter setter (Tannen p) =
+    Tannen $ fmap (prolensical getter setter) p
+  {-# INLINE prolensical #-}
+
 
 ----------------------------------------------------------------------------
 -- * Tambara
@@ -164,6 +258,14 @@ newtype Tambara p a b = Tambara { runTambara :: forall c. p (a, c) (b, c) }
 instance Profunctor p => Profunctor (Tambara p) where
   dimap f g (Tambara p) = Tambara $ dimap (first f) (first g) p
   {-# INLINE dimap #-}
+  lmap f (Tambara p) = Tambara $ lmap (first f) p
+  {-# INLINE lmap #-}
+  rmap f (Tambara p) = Tambara $ rmap (first f) p
+  {-# INLINE rmap #-}
+  f #. Tambara g = Tambara (first f #. g)
+  {-# INLINE (#.) #-}
+  Tambara f .# g = Tambara (f .# first g)
+  {-# INLINE (.#) #-}
 
 instance ProfunctorFunctor Tambara where
   promap f (Tambara p) = Tambara (f p)
@@ -180,6 +282,12 @@ instance ProfunctorComonad Tambara where
 instance Profunctor p => Strong (Tambara p) where
   first' = runTambara . produplicate
   {-# INLINE first' #-}
+  prolensical getter setter (Tambara p) =
+    Tambara $ dimap (\ ~(s,c) -> (getter s,(s, c)))
+                    (\ ~(b,~(s,c)) -> (setter s b, c)) p
+  lensical getter setter (Tambara p) =
+    Tambara $ dimap (\ ~(s,c) -> (getter s, (s, c)))
+                    (\ ~(fb,~(s,c)) -> (setter s <$> fb, c)) p
 
 instance Category p => Category (Tambara p) where
   id = Tambara id
@@ -246,6 +354,100 @@ tambara f p = Tambara $ f $ first' p
 untambara :: Profunctor q => (p :-> Tambara q) -> p :-> q
 untambara f p = dimap (\a -> (a,())) fst $ runTambara $ f p
 
+
+-- Some sort of (co?)freeish strong profunctor.
+newtype Tambourine p a b =
+  Tambourine { runTambourine :: forall s t. (s -> a) -> (s -> b -> t) -> p s t }
+instance Profunctor (Tambourine p) where
+  dimap = dimapProlensically
+  (#.) _ = coerce
+  p .# _ = coerce p
+
+instance Strong (Tambourine p) where
+  first' = firstLensically
+  second' = secondProlensically
+  lensical getter setter (Tambourine p) = Tambourine $
+    \sa sbt -> p (getter . sa) (\s1 fb -> sbt s1 ((setter (sa s1)) <$> fb))
+  prolensical getter setter (Tambourine p) = Tambourine $
+    \sa sbt -> p (getter . sa) (\s1 b -> sbt s1 $ setter (sa s1) b)
+
+instance ProfunctorFunctor Tambourine where
+  promap f (Tambourine p) = Tambourine $ \getter setter -> f (p getter setter)
+
+instance ProfunctorComonad Tambourine where
+  proextract (Tambourine p) = p id (flip const)
+  produplicate (Tambourine p) = Tambourine $
+    \getter setter -> Tambourine $ \getter' setter' ->
+       p (getter . getter') (\s1 b -> setter' s1 (setter (getter' s1) b))
+
+tambourineToTambara :: Tambourine p a b -> Tambara p a b
+tambourineToTambara (Tambourine q) =
+  Tambara $ q fst (\(_,c) b -> (b,c))
+
+tambaraToTambourine :: Profunctor p => Tambara p a b -> Tambourine p a b
+tambaraToTambourine (Tambara q) =
+  Tambourine $ \sa sbt -> dimap (\s -> (sa s, s)) (uncurry (flip sbt)) q
+
+instance (Profunctor p, Category p) => Category (Tambourine p) where
+  -- id could also be defined
+  -- id = Tambourine $ \sa sbt -> lmap (\s -> sbt s (sa s)) id
+  id = Tambourine $ \sa sbt -> rmap (\s -> sbt s (sa s)) id
+  Tambourine p . Tambourine q = Tambourine $
+    \sa sbt -> p snd (sbt . fst) . q sa (,)
+
+instance (Profunctor p, Arrow p) => Arrow (Tambourine p) where
+  first = first'
+  arr f = Tambourine $ \sa sbt -> arr $ \s -> sbt s (f (sa s))
+
+instance (Profunctor p, ArrowApply p) => ArrowApply (Tambourine p) where
+  app = Tambourine $ \sa sbt -> flip lmap app $
+    \s -> case sa s of
+            (Tambourine t, b) -> (t (const b) sbt, s)
+
+instance (Profunctor p, ArrowLoop p) => ArrowLoop (Tambourine p) where
+  loop = tambaraToTambourine . loop . tambourineToTambara
+{-
+  -- TODO Check if this uses the right d, and if it otherwise
+  -- makes sense.
+  loop (Tambourine p) = Tambourine $ \sa sbt ->
+    loop $ p (first sa) (\ ~(s,_d) ~(c,d) -> (sbt s c, d))
+-}
+
+
+instance (Profunctor p, ArrowZero p) => ArrowZero (Tambourine p) where
+  zeroArrow = Tambourine $ \_ sbt -> rmap (uncurry sbt) zeroArrow
+
+instance (Profunctor p, ArrowPlus p) => ArrowPlus (Tambourine p) where
+  Tambourine f <+> Tambourine g = Tambourine $ \sa sbt -> f sa sbt <+> g sa sbt
+
+instance Functor (Tambourine p a) where
+  fmap = rmap
+
+instance (Profunctor p, Arrow p) => Applicative (Tambourine p a) where
+  pure x = Tambourine $ \_ sbt -> arr (\s -> sbt s x)
+  -- TODO See if this is worth implementing directly.
+  f <*> g = tambaraToTambourine (tambourineToTambara f <*> tambourineToTambara g)
+
+instance (Profunctor p, ArrowPlus p) => Alternative (Tambourine p a) where
+  empty = zeroArrow
+  f <|> g = f <+> g
+
+instance (Profunctor p, ArrowPlus p) => Monoid (Tambourine p a b) where
+  mempty = zeroArrow
+  mappend f g = f <+> g
+
+liftTambourine :: Strong p => p :-> Tambourine p
+liftTambourine p = Tambourine $ \sa sbt -> prolensical sa sbt p
+
+lowerTambourine :: Tambourine p :-> p
+lowerTambourine (Tambourine p) = p id (flip const)
+
+tambourine :: (p :-> q) -> Tambourine p :-> q
+tambourine f = f . lowerTambourine
+
+untambourine :: Strong p => (Tambourine p :-> q) -> p :-> q
+untambourine f = f . liftTambourine
+
 ----------------------------------------------------------------------------
 -- * Pastro
 ----------------------------------------------------------------------------
@@ -307,6 +509,45 @@ pastro f (Pastro r g l) = dimap l r (first' (f g))
 -- @
 unpastro :: (Pastro p :-> q) -> p :-> q
 unpastro f p = f (Pastro fst p (\a -> (a, ())))
+
+-- Some other (co?)freeish strong profunctor.
+data Pasta p s t where
+  Pasta :: (s -> a) -> (s -> b -> t) -> p a b -> Pasta p s t
+
+instance Profunctor (Pasta p) where
+  dimap = dimapProlensically
+
+instance Strong (Pasta p) where
+  first' = firstLensically
+  second' = secondProlensically
+  prolensical getter setter (Pasta sa sbt p) =
+    Pasta (sa . getter) (\s b1 -> setter s (sbt (getter s) b1)) p
+
+instance ProfunctorFunctor Pasta where
+  promap f (Pasta sa sbt p) = Pasta sa sbt (f p)
+
+instance ProfunctorMonad Pasta where
+  proreturn p = Pasta id (flip const) p
+  projoin (Pasta sa sbt (Pasta sa' sbt' p)) =
+    Pasta (sa' . sa) (\a -> sbt a . sbt' (sa a)) p
+
+instance ProfunctorAdjunction Pasta Tambourine where
+  counit (Pasta sa sbt (Tambourine p)) = p sa sbt
+  unit p = Tambourine $ \sa sbt -> Pasta sa sbt p
+
+liftPasta :: p :-> Pasta p
+liftPasta = Pasta id (flip const)
+
+lowerPasta :: Strong p => Pasta p :-> p
+lowerPasta (Pasta getter setter p) = prolensical getter setter p
+
+pasta :: Strong p => (p :-> q) -> Pasta p :-> q
+pasta f = f . lowerPasta
+
+unpasta :: (Pasta p :-> q) -> p :-> q
+unpasta f = f . liftPasta
+
+
 
 --------------------------------------------------------------------------------
 -- * Costrength for (,)

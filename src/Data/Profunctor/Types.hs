@@ -215,6 +215,10 @@ instance Profunctor (Forget r) where
   {-# INLINE lmap #-}
   rmap _ (Forget k) = Forget k
   {-# INLINE rmap #-}
+  (#.) _ = coerce
+  {-# INLINE (#.) #-}
+  f .# _ = coerce f
+  {-# INLINE (.#) #-}
 
 instance Functor (Forget r a) where
   fmap _ (Forget k) = Forget k
