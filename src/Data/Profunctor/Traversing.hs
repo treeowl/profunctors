@@ -63,6 +63,12 @@ rmapWandering g = wander (\afb a' -> g <$> afb a')
 leftTraversing :: Traversing p => p a b -> p (Either a c) (Either b c)
 leftTraversing = dimap swapE swapE . traverse'
 
+leftWandering :: Traversing p => p a b -> p (Either a c) (Either b c)
+leftWandering = wander $ \afb eac ->
+  case eac of
+    Left a -> Left <$> afb a
+    Right rc -> pure (Right rc)
+
 rightTraversing :: Traversing p => p a b -> p (Either c a) (Either c b)
 rightTraversing = traverse'
 
