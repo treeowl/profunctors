@@ -5,6 +5,7 @@
 {-# LANGUAGE Unsafe #-}
 #endif
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE InstanceSigs #-}
 -----------------------------------------------------------------------------
 -- |
 -- Copyright   :  (C) 2011-2015 Edward Kmett
@@ -52,9 +53,11 @@ import Prelude hiding (id,(.),sequence)
 
 #if __GLASGOW_HASKELL__ >= 708
 import Data.Coerce
-#else
-import Unsafe.Coerce
+import Data.Type.Coercion (Coercion (..))
+import qualified Data.Type.Coercion as DTC
 #endif
+
+import Unsafe.Coerce
 
 {-# ANN module "Hlint: ignore Redundant lambda" #-}
 {-# ANN module "Hlint: ignore Collapse lambdas" #-}
@@ -146,10 +149,13 @@ class Profunctor p where
   -- @('Profuctor.Unsafe.#.') ≡ \\f -> \\p -> p \`seq\` 'rmap' f p@
 #if __GLASGOW_HASKELL__ >= 708
   ( #. ) :: Coercible c b => (b -> c) -> p a b -> p a c
+  ( #. ) = case rliftCoerce of
+             Nothing -> \f -> \p -> p `seq` rmap f p
+             Just c -> \_ -> DTC.coerceWith (c Coercion)
 #else
   ( #. ) :: (b -> c) -> p a b -> p a c
-#endif
   ( #. ) = \f -> \p -> p `seq` rmap f p
+#endif
   {-# INLINE ( #. ) #-}
 
   -- | Strictly map the first argument argument
@@ -176,11 +182,23 @@ class Profunctor p where
   -- @('.#') ≡ \\p -> p \`seq\` \\f -> 'lmap' f p@
 #if __GLASGOW_HASKELL__ >= 708
   ( .# ) :: Coercible b a => p b c -> (a -> b) -> p a c
+  ( .# ) = case lliftCoerce of
+             Nothing -> \p -> p `seq` \f -> lmap f p
+             Just c -> \p _ -> DTC.coerceWith (c Coercion) p
 #else
   ( .# ) :: p b c -> (a -> b) -> p a c
-#endif
   ( .# ) = \p -> p `seq` \f -> lmap f p
+#endif
   {-# INLINE ( .# ) #-}
+
+#if __GLASGOW_HASKELL__ >= 708
+  lliftCoerce :: Maybe (Coercion s a -> Coercion (p a c) (p s c))
+  lliftCoerce = (\c l -> c l Coercion) <$> diliftCoerce
+  rliftCoerce :: Maybe (Coercion b t -> Coercion (p c b) (p c t))
+  rliftCoerce = (\c r -> c Coercion r) <$> diliftCoerce
+  diliftCoerce :: Maybe (Coercion s a -> Coercion b t -> Coercion (p a b) (p s t))
+  diliftCoerce = Nothing
+#endif
 
 #if __GLASGOW_HASKELL__ >= 708
   {-# MINIMAL dimap | (lmap, rmap) #-}
@@ -196,6 +214,7 @@ instance Profunctor (->) where
 #if __GLASGOW_HASKELL__ >= 708
   ( #. ) _ = coerce (\x -> x :: b) :: forall a b. Coercible b a => a -> b
   ( .# ) pbc _ = coerce pbc
+  diliftCoerce = Just (\Coercion Coercion -> Coercion)
 #else
   ( #. ) _ = unsafeCoerce
   ( .# ) pbc _ = unsafeCoerce pbc
@@ -212,6 +231,7 @@ instance Profunctor Tagged where
   {-# INLINE rmap #-}
 #if __GLASGOW_HASKELL__ >= 708
   ( #. ) _ = coerce (\x -> x :: b) :: forall a b. Coercible b a => a -> b
+  diliftCoerce = Just (\Coercion Coercion -> Coercion)
 #else
   ( #. ) _ = unsafeCoerce
 #endif
@@ -229,6 +249,7 @@ instance Monad m => Profunctor (Kleisli m) where
   -- We cannot safely overload (#.) because we didn't provide the 'Monad'.
 #if __GLASGOW_HASKELL__ >= 708
   ( .# ) pbc _ = coerce pbc
+  lliftCoerce = Just (\Coercion -> Coercion)
 #else
   ( .# ) pbc _ = unsafeCoerce pbc
 #endif
@@ -244,6 +265,7 @@ instance Functor w => Profunctor (Cokleisli w) where
   -- We cannot safely overload (.#) because we didn't provide the 'Functor'.
 #if __GLASGOW_HASKELL__ >= 708
   ( #. ) _ = coerce (\x -> x :: b) :: forall a b. Coercible b a => a -> b
+  rliftCoerce = Just (\Coercion -> Coercion)
 #else
   ( #. ) _ = unsafeCoerce
 #endif
@@ -256,6 +278,9 @@ instance Contravariant f => Profunctor (Clown f) where
   {-# INLINE rmap #-}
   dimap f _ (Clown fa) = Clown (contramap f fa)
   {-# INLINE dimap #-}
+#if __GLASGOW_HASKELL__ >= 708
+  rliftCoerce = Just (\Coercion -> Coercion)
+#endif
 
 instance Functor f => Profunctor (Joker f) where
   lmap _ (Joker fb) = Joker fb
@@ -264,6 +289,9 @@ instance Functor f => Profunctor (Joker f) where
   {-# INLINE rmap #-}
   dimap _ g (Joker fb) = Joker (fmap g fb)
   {-# INLINE dimap #-}
+#if __GLASGOW_HASKELL__ >= 708
+  lliftCoerce = Just (\Coercion -> Coercion)
+#endif
 
 instance (Profunctor p, Functor f, Functor g) => Profunctor (Biff p f g) where
   lmap f (Biff p) = Biff (lmap (fmap f) p)
@@ -281,6 +309,36 @@ instance (Profunctor p, Profunctor q) => Profunctor (Product p q) where
   {-# INLINE ( #. ) #-}
   ( .# ) (Pair p q) f = Pair (p .# f) (q .# f)
   {-# INLINE ( .# ) #-}
+
+  -- This is rather disgusting!
+  --
+  -- data Product p q a b ~= (p a b, q a b)
+  --
+  -- so if we can produce a coercion from (p a b) to (p s t)
+  -- and one from (q a b) to (q s t), we should surely be able
+  -- to produce one from (Product p q a b) to (Product p q s t).
+  -- Unfortunately, GHC isn't smart enough for that, so we have to
+  -- cheat our way into a perfecty legitimate coercion using
+  -- unsafeCoerce.
+  diliftCoerce :: forall s t a b. Maybe
+                  (Coercion s a -> Coercion b t
+                     -> Coercion (Product p q a b) (Product p q s t))
+  diliftCoerce = (\p q c1 c2 ->
+       case p c1 c2 of { Coercion ->
+       case q c1 c2 of { Coercion ->
+          unsafeCoerce (Coercion :: Coercion (p a b, q a b) (p s t, q s t)) }})
+       <$> (diliftCoerce :: Maybe (Coercion s a -> Coercion b t
+                                   -> Coercion (p a b) (p s t)))
+       <*> (diliftCoerce :: Maybe (Coercion s a -> Coercion b t
+                                   -> Coercion (q a b) (q s t)))
+  lliftCoerce :: forall s a c.
+                 Maybe (Coercion s a -> Coercion (Product p q a c) (Product p q s c))
+  lliftCoerce = (\p q c ->
+     case p c of { Coercion ->
+     case q c of { Coercion ->
+       unsafeCoerce $ (Coercion :: Coercion (p a c, q a c) (p s c, q s c)) }})
+                 <$> (lliftCoerce :: Maybe (Coercion s a -> Coercion (p a c) (p s c)))
+                 <*> (lliftCoerce :: Maybe (Coercion s a -> Coercion (q a c) (q s c)))
 
 instance (Functor f, Profunctor p) => Profunctor (Tannen f p) where
   lmap f (Tannen h) = Tannen (lmap f <$> h)
